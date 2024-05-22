@@ -1,0 +1,25 @@
+---
+name: Config
+testcases:
+  - name: help
+    description: Show help
+    steps:
+      - command: [./ldap2pg.sh, "-?"]
+      - command: [./ldap2pg.sh, "--help"]
+
+  - name: version
+    description: Show version
+    steps:
+      - command: [./ldap2pg.sh, "-V"]
+      - command: [./ldap2pg.sh, "--version"]
+
+  - name: stdin
+    description: Configure from stdin
+    steps:
+      - stdin: |
+          version: 6
+          rules:
+            - role: stdinuser
+        shell: |
+          # Remove LDAP vers to trigger failure if ldap2pg tries a search.
+          env -u LDAPURI -u LDAPHOST -u LDAPPORT -u LDAPPASSWORD ./ldap2pg.sh --config=-
