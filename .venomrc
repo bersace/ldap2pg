@@ -1,0 +1,5 @@
+# -*- yaml -*-
+---
+outputdir: test/out
+stop_on_failure: true
+verbosity: 2

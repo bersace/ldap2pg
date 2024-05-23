@@ -1,0 +1,45 @@
+---
+name: Config
+testcases:
+  - name: fixture
+    steps:
+      - command: [./fixtures/postgres/reset.sh]
+      - command: [./fixtures/postgres/nominal.sh]
+  - name: run
+    steps:
+      - command: [./ldap2pg.sh, "--check"]
+        assertions:
+          - result.code MustEqual 1
+      - command: [./ldap2pg.sh, "--real"]
+      - command: [./ldap2pg.sh, "--check"]
+  - name: roles
+    steps:
+      - type: sql
+        driver: postgres
+        dsn: postgresql://postgres@postgres.ldap2pg.docker/postgres?sslmode=disable
+        commands:
+          # d* role must be dropped
+          - SELECT rolname FROM pg_roles WHERE rolname LIKE 'd%';
+          - SELECT rolname::text FROM pg_roles ORDER BY 1;
+          - |
+            SELECT DISTINCT member::regrole::text
+            FROM pg_auth_members
+            WHERE roleid::regrole = 'readers'::regrole
+            ORDER BY 1;
+          - |
+            SELECT DISTINCT member::regrole::text
+            FROM pg_auth_members
+            WHERE roleid::regrole = 'writers'::regrole
+            ORDER BY 1;
+          - |
+            SELECT DISTINCT member::regrole::text
+            FROM pg_auth_members
+            WHERE roleid::regrole = 'owners'::regrole
+            ORDER BY 1;
+        assertions:
+          - result.queries.queries0.rows.__Len__ ShouldEqual 0
+          - result.queries.queries1.rows.rows0.rolname ShouldEqual alain
+          - result.queries.queries2.rows.rows0.member ShouldEqual alain
+          - result.queries.queries2.rows.rows1.member ShouldEqual corinne
+          - result.queries.queries3.rows.rows1.member ShouldEqual charles
+          - result.queries.queries4.rows.rows0.member ShouldEqual alter

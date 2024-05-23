@@ -5,3 +5,4 @@ docker-compose.override.yml
 # test/conftest.py creates .env files
 .env
 venom*.log
+*.dump.json
