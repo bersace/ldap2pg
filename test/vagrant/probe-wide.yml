@@ -1,0 +1,11 @@
+# Stress probe: wide search returning hundreds of entries to exercise
+# multi-buffer SASL reads. Dry-run only.
+version: 6
+rules:
+- ldapsearch:
+    base: dc=bridoulou,dc=fr
+    scope: sub
+    filter: "(cn=*)"
+  role:
+    name: "probe_{cn}"
+    comment: "dn={dn}"

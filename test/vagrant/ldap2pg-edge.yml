@@ -1,0 +1,32 @@
+# Edge-case config for the GSSAPI native ldapsearch path.
+#
+# foldgroup members live in an OU whose name pushes their DN beyond the
+# 76-column LDIF wrap of ldapsearch(1):
+#  - fold1: plain ASCII DN -> folded plain member value
+#  - zoé-fold2: UTF-8 DN -> folded base64 member value
+#
+# {member.cn} extracts the RDN from the member DN; {member.sAMAccountName} is
+# not a known RDN and forces a per-member sub-search using the full member DN
+# as search base, which fails if the DN was corrupted while parsing LDIF.
+version: 6
+
+postgres:
+  roles_blacklist_query: [nominal, postgres, pg_*]
+  databases_query: [nominal]
+
+rules:
+- description: "Members of foldgroup, by RDN extraction."
+  ldapsearch:
+    base: cn=users,dc=bridoulou,dc=fr
+    filter: "(cn=foldgroup)"
+  role:
+    name: 'edge_{member.cn}'
+    options: LOGIN
+
+- description: "Members of foldgroup, by sub-search on member DN."
+  ldapsearch:
+    base: cn=users,dc=bridoulou,dc=fr
+    filter: "(cn=foldgroup)"
+  role:
+    name: 'sam_{member.sAMAccountName}'
+    options: LOGIN

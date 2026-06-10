@@ -1,0 +1,55 @@
+# Vagrant environment to test ldap2pg GSSAPI/Kerberos authentication against
+# a real Samba AD DC (realm bridoulou.fr, same as docker-compose fixtures).
+#
+#   ldap : Samba AD DC (KDC + LDAP, GSSAPI, "ldap server require strong auth = yes")
+#   pg   : PostgreSQL + ldap2pg + krb5 client + ldap-utils (native ldapsearch)
+#
+# Build the linux binary first (Docker is only used for compilation):
+#   docker run --rm -v "$PWD/../..:/src" -w /src -e GOOS=linux -e GOARCH=amd64 \
+#     -e CGO_ENABLED=0 golang:1.25 go build -o test/vagrant/.build/ldap2pg .
+#
+# Then:
+#   vagrant up ldap
+#   vagrant up pg
+#   vagrant ssh pg -c 'run-gssapi-test'
+
+LDAP_IP = "192.168.56.10"
+PG_IP = "192.168.56.11"
+
+Vagrant.configure("2") do |config|
+  config.vm.box = "debian/bookworm64"
+  config.vm.synced_folder ".", "/vagrant", disabled: true
+
+  config.vm.provider "virtualbox" do |vb|
+    vb.linked_clone = true
+  end
+
+  config.vm.define "ldap" do |ldap|
+    ldap.vm.hostname = "ldap"
+    ldap.vm.network "private_network", ip: LDAP_IP
+    ldap.vm.provider "virtualbox" do |vb|
+      vb.memory = 2048
+      vb.cpus = 2
+    end
+    ldap.vm.provision "file", source: "../fixtures/samba/nominal.sh", destination: "/tmp/fixtures/nominal.sh"
+    ldap.vm.provision "file", source: "../fixtures/samba/extra.sh", destination: "/tmp/fixtures/extra.sh"
+    ldap.vm.provision "file", source: "fixtures-fold.sh", destination: "/tmp/fixtures/fold.sh"
+    ldap.vm.provision "shell", path: "provision-samba.sh"
+  end
+
+  config.vm.define "pg" do |pg|
+    pg.vm.hostname = "pg"
+    pg.vm.network "private_network", ip: PG_IP
+    pg.vm.provider "virtualbox" do |vb|
+      vb.memory = 1536
+      vb.cpus = 2
+    end
+    pg.vm.provision "file", source: "../fixtures/postgres/reset.sh", destination: "/tmp/fixtures/reset.sh"
+    pg.vm.provision "file", source: "../fixtures/postgres/nominal.sh", destination: "/tmp/fixtures/nominal.sh"
+    pg.vm.provision "file", source: "../../ldap2pg.yml", destination: "/tmp/ldap2pg.yml"
+    pg.vm.provision "file", source: "ldap2pg-edge.yml", destination: "/tmp/ldap2pg-edge.yml"
+    pg.vm.provision "file", source: "run-test.sh", destination: "/tmp/run-test.sh"
+    pg.vm.provision "file", source: ".build/ldap2pg", destination: "/tmp/ldap2pg.bin"
+    pg.vm.provision "shell", path: "provision-pg.sh"
+  end
+end
