@@ -702,8 +702,10 @@ func (l *Conn) GSSAPIBindRequestWithAPOptions(client GSSAPIClient, req *GSSAPIBi
 	var err error
 	var reqToken []byte
 	var recvToken []byte
+	var wrapper SASLWrapper
 	needInit := true
 	for {
+		var flags sendMessageFlags
 		if needInit {
 			// Establish secure context between client and server.
 			reqToken, needInit, err = client.InitSecContextWithOptions(req.ServicePrincipalName, recvToken, APOptions)
@@ -716,23 +718,49 @@ func (l *Conn) GSSAPIBindRequestWithAPOptions(client GSSAPIClient, req *GSSAPIBi
 			if err != nil {
 				return err
 			}
+			// When the client negotiated a SASL security layer, all
+			// traffic after the final bind response is wrapped. Flag the
+			// final exchange with the startTLS machinery so that the
+			// reader goroutine stops cleanly on the bind response, before
+			// any wrapped bytes reach its buffered reader.
+			if sl, ok := client.(interface{ SecurityLayer() any }); ok {
+				if w, ok := sl.SecurityLayer().(SASLWrapper); ok && w != nil {
+					wrapper = w
+					flags = startTLS
+				}
+			}
 		}
 		// Send Bind request containing the current token and extract the
 		// token sent by server.
-		recvToken, err = l.saslBindTokenExchange(req.Controls, reqToken)
+		recvToken, err = l.saslBindTokenExchange(req.Controls, reqToken, flags)
+		if flags&startTLS != 0 {
+			// The reader stopped cleanly after receiving the final bind
+			// response. Install the security layer on success and restart
+			// the reader. On a failed bind the connection stays unwrapped
+			// for the caller to close.
+			if err == nil {
+				l.conn = newSASLConn(l.conn, wrapper)
+			}
+			go l.reader()
+		}
 		if err != nil {
 			return err
 		}
 
-		if !needInit && len(recvToken) == 0 {
-			break
+		if !needInit {
+			if len(recvToken) == 0 {
+				break
+			}
+			if wrapper != nil {
+				return fmt.Errorf("ldap: unexpected SASL token after GSSAPI security layer negotiation")
+			}
 		}
 	}
 
 	return nil
 }
 
-func (l *Conn) saslBindTokenExchange(reqControls []Control, reqToken []byte) ([]byte, error) {
+func (l *Conn) saslBindTokenExchange(reqControls []Control, reqToken []byte, flags sendMessageFlags) ([]byte, error) {
 	// Construct LDAP Bind request with GSSAPI SASL mechanism.
 	envelope := ber.Encode(ber.ClassUniversal, ber.TypeConstructed, ber.TagSequence, nil, "LDAP Request")
 	envelope.AppendChild(ber.NewInteger(ber.ClassUniversal, ber.TypePrimitive, ber.TagInteger, l.nextMessageID(), "MessageID"))
@@ -752,7 +780,7 @@ func (l *Conn) saslBindTokenExchange(reqControls []Control, reqToken []byte) ([]
 		envelope.AppendChild(encodeControls(reqControls))
 	}
 
-	msgCtx, err := l.sendMessage(envelope)
+	msgCtx, err := l.sendMessageWithFlags(envelope, flags)
 	if err != nil {
 		return nil, err
 	}

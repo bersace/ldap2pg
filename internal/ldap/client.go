@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -27,6 +28,10 @@ type Client struct {
 }
 
 var Watch perf.StopWatch
+
+// MIT krb5 credential cache types other than FILE, unsupported by gokrb5.
+// Bare paths and Windows drive letters (single letter) are not cache types.
+var ccacheTypes = []string{"DIR", "KEYRING", "MEMORY", "KCM", "API", "MSLSA"}
 
 func Connect() (client Client, err error) {
 	uri := k.String("URI")
@@ -98,7 +103,13 @@ func Connect() (client Client, err error) {
 		client.SaslAuthCID = k.String("SASL_AUTHCID")
 		ccache, ok := os.LookupEnv("KRB5CCNAME")
 		if ok {
-			ccache = strings.TrimPrefix(ccache, "FILE:")
+			if rest, found := strings.CutPrefix(ccache, "FILE:"); found {
+				ccache = rest
+			} else if t, _, found := strings.Cut(ccache, ":"); found && slices.Contains(ccacheTypes, t) {
+				// gokrb5 only reads MIT FILE-format credential caches.
+				err = fmt.Errorf("unsupported KRB5CCNAME type %s: only FILE: credential caches are supported", t)
+				return
+			}
 		} else {
 			uid := os.Getuid()
 			ccache = fmt.Sprintf("/tmp/krb5cc_%d", uid)
@@ -118,6 +129,9 @@ func Connect() (client Client, err error) {
 		err = client.Conn.GSSAPIBind(sspiClient, spn, "")
 		if err != nil {
 			return client, err
+		}
+		if sspiClient.SecurityLayer() != nil {
+			slog.Debug("LDAP SASL security layer installed.", "layer", "integrity")
 		}
 	default:
 		err = fmt.Errorf("unhandled SASL_MECH")
@@ -171,5 +185,5 @@ func LogRetryError(n uint, err error) {
 
 // Build service Principal from URI.
 func buildServicePrincipalName(uri *url.URL) string {
-	return "ldap/" + strings.Split(uri.Host, ":")[0]
+	return "ldap/" + uri.Hostname()
 }

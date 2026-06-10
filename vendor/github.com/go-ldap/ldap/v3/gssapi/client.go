@@ -1,6 +1,7 @@
 package gssapi
 
 import (
+	"encoding/binary"
 	"fmt"
 
 	"github.com/jcmturner/gokrb5/v8/client"
@@ -16,12 +17,106 @@ import (
 	"github.com/jcmturner/gokrb5/v8/types"
 )
 
+// SASL security layer bitmasks, RFC 4752 section 3.3.
+const (
+	saslSecurityNone            byte = 1
+	saslSecurityIntegrity       byte = 2
+	saslSecurityConfidentiality byte = 4
+)
+
 // Client implements ldap.GSSAPIClient interface.
 type Client struct {
 	*client.Client
 
-	ekey   types.EncryptionKey
-	Subkey types.EncryptionKey
+	ekey     types.EncryptionKey
+	Subkey   types.EncryptionKey
+	secLayer *saslSecurityLayer
+}
+
+// saslSecurityLayer implements the SASL "integrity" security layer
+// (GSS_Wrap with conf_flag FALSE) on top of the established Kerberos
+// context. Servers like Samba AD with "ldap server require strong auth =
+// yes" reject GSSAPI binds that select no security layer with LDAP result
+// 8: SASL:[GSSAPI]: Sign or Seal are required.
+//
+// gokrb5 wrap tokens only support signing (no encryption), so only the
+// integrity layer is available, equivalent to ldapsearch -O maxssf=1.
+//
+// Wrap is only called from the connection writer goroutine and Unwrap only
+// from the reader goroutine, so no locking is needed.
+type saslSecurityLayer struct {
+	ekey       types.EncryptionKey // AP exchange session key
+	subkey     types.EncryptionKey // acceptor subkey, may be empty
+	tokenFlags byte                // flags for our initiator tokens
+	sendSeq    uint64              // next initiator wrap token sequence number
+	maxSend    int                 // max plaintext bytes per wrap token
+}
+
+// MaxPlaintext returns the maximum plaintext chunk size so that wrapped
+// tokens stay below the server-advertised maximum buffer size.
+func (s *saslSecurityLayer) MaxPlaintext() int { return s.maxSend }
+
+// Wrap signs b into an initiator wrap token (RFC 4121, conf_flag FALSE).
+func (s *saslSecurityLayer) Wrap(b []byte) ([]byte, error) {
+	key := s.sendKey()
+	encType, err := crypto.GetEtype(key.KeyType)
+	if err != nil {
+		return nil, err
+	}
+	token := &gssapi.WrapToken{
+		Flags:     s.tokenFlags,
+		EC:        uint16(encType.GetHMACBitLength() / 8),
+		RRC:       0,
+		SndSeqNum: s.sendSeq,
+		Payload:   b,
+	}
+	if err := token.SetCheckSum(key, keyusage.GSSAPI_INITIATOR_SEAL); err != nil {
+		return nil, err
+	}
+	s.sendSeq++
+	return token.Marshal()
+}
+
+// Unwrap verifies an acceptor wrap token and returns its payload.
+func (s *saslSecurityLayer) Unwrap(b []byte) ([]byte, error) {
+	token := &gssapi.WrapToken{}
+	if err := token.Unmarshal(b, true); err != nil {
+		return nil, err
+	}
+	if (token.Flags & 0b10) != 0 {
+		return nil, fmt.Errorf("sealed (confidentiality) tokens are not supported")
+	}
+	key := s.ekey
+	if (token.Flags&0b100) != 0 && len(s.subkey.KeyValue) != 0 {
+		key = s.subkey
+	}
+	if _, err := token.Verify(key, keyusage.GSSAPI_ACCEPTOR_SEAL); err != nil {
+		return nil, err
+	}
+	return token.Payload, nil
+}
+
+func (s *saslSecurityLayer) sendKey() types.EncryptionKey {
+	if (s.tokenFlags&0b100) != 0 && len(s.subkey.KeyValue) != 0 {
+		return s.subkey
+	}
+	return s.ekey
+}
+
+// SecurityLayer returns the negotiated SASL security layer, or nil when the
+// bind selected no layer. The ldap package type-asserts the result against
+// its SASLWrapper interface to install connection wrapping after the bind.
+func (client *Client) SecurityLayer() any {
+	if client.secLayer == nil {
+		return nil
+	}
+	return client.secLayer
+}
+
+func copyKey(k types.EncryptionKey) types.EncryptionKey {
+	kv := make([]byte, len(k.KeyValue))
+	copy(kv, k.KeyValue)
+	return types.EncryptionKey{KeyType: k.KeyType, KeyValue: kv}
 }
 
 // NewClientWithKeytab creates a new client from a keytab credential.
@@ -192,8 +287,42 @@ func (client *Client) NegotiateSaslAuth(input []byte, authzid string) ([]byte, e
 		return nil, fmt.Errorf("server send bad final token for SASL GSSAPI Handshake")
 	}
 
-	// We never want a security layer
-	b := [4]byte{0, 0, 0, 0}
+	// RFC 4752 section 3.1: the server sends a bitmask of supported
+	// security layers and the maximum wrapped buffer size it accepts.
+	serverOffer := pl[0]
+	serverMaxBuf := binary.BigEndian.Uint32(pl) & 0x00FFFFFF
+
+	var chosen byte
+	var ourMaxBuf uint32
+	switch {
+	case (serverOffer & saslSecurityIntegrity) != 0:
+		// Prefer integrity (sign) when the server supports it: servers
+		// requiring strong auth (Samba/AD) reject the "none" choice.
+		chosen = saslSecurityIntegrity
+		ourMaxBuf = 0x00FFFFFF // our Unwrap accepts tokens of any size
+		if serverMaxBuf < 256 {
+			return nil, fmt.Errorf("server SASL buffer size too small: %d", serverMaxBuf)
+		}
+		client.secLayer = &saslSecurityLayer{
+			ekey:    copyKey(client.ekey),
+			subkey:  copyKey(client.Subkey),
+			sendSeq: 2, // the final handshake token below uses 1
+			// Room for the 16 byte token header and the trailing checksum.
+			maxSend: int(serverMaxBuf) - 64,
+		}
+		if len(client.Subkey.KeyValue) != 0 {
+			client.secLayer.tokenFlags = 0b100
+		}
+	case (serverOffer & saslSecurityNone) != 0:
+		chosen = saslSecurityNone
+		ourMaxBuf = 0
+	default:
+		return nil, fmt.Errorf("no supported SASL security layer in server offer 0x%02x (confidentiality is not implemented)", serverOffer)
+	}
+
+	var b [4]byte
+	binary.BigEndian.PutUint32(b[:], ourMaxBuf)
+	b[0] = chosen
 	payload := append(b[:], []byte(authzid)...)
 
 	encType, err := crypto.GetEtype(key.KeyType)
